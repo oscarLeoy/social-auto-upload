@@ -4,6 +4,7 @@ from datetime import datetime
 import asyncio
 import inspect
 import os
+import select
 import sys
 from pathlib import Path
 
@@ -29,16 +30,83 @@ def _msg(emoji: str, text: str) -> str:
     return f"{emoji} {text}"
 
 
+DOUYIN_MANAGE_URL = "https://creator.douyin.com/creator-micro/content/manage"
+
+
+class DouyinSubmissionUnknown(RuntimeError):
+    """The platform may have received the submission."""
+
+
+async def _find_recent_work(page: Page, title: str, kind: str, clicked_at: datetime) -> None:
+    await page.goto(DOUYIN_MANAGE_URL, wait_until="domcontentloaded", timeout=10000)
+    search = page.get_by_placeholder("搜索作品标题、正文", exact=True)
+    await search.fill(title, timeout=5000)
+    await search.press("Enter", timeout=5000)
+    await page.wait_for_function(
+        """({title, kind, clickedAt}) => {
+            const cards = [...document.querySelectorAll('[class^="video-card-content"]')];
+            const matches = cards.filter(card => {
+                const lines = card.innerText.split('\\n').map(line => line.trim());
+                const sameKind = /(?:^|\\n)\\d+张图(?:\\n|$)/.test(card.innerText);
+                if (sameKind !== (kind === "图文")) return false;
+                if (!lines.some(line => line === title || line.startsWith(title + " ")
+                    || line.startsWith(title + "。"))) return false;
+                if (!lines.some(line => ["已发布", "审核中", "定时发布"].includes(line))) return false;
+                const date = lines.join(" ").match(/(\\d{4})年(\\d{2})月(\\d{2})日 (\\d{2}):(\\d{2})/);
+                if (!date) return false;
+                const [, y, m, d, h, min] = date.map(Number);
+                const time = new Date(y, m - 1, d, h, min).getTime();
+                return time >= Math.floor(clickedAt / 60000) * 60000 && time <= Date.now();
+            });
+            return matches.length === 1;
+        }""",
+        arg={"title": title, "kind": kind, "clickedAt": int(clicked_at.timestamp() * 1000)},
+        timeout=10000,
+    )
+
+
+async def _publish_once(page: Page, title: str, kind: str, *, after_click=None) -> None:
+    button = page.get_by_role("button", name="发布", exact=True)
+    clicked_at = datetime.now()
+    # A click error can arrive after dispatch, so it cannot authorize another click.
+    try:
+        await button.click(timeout=5000)
+    except Exception:
+        douyin_logger.warning(f"{kind}发布按钮结果不明，继续核对提交结果")
+
+    async def wait_for_result():
+        verification = asyncio.create_task(after_click(page)) if after_click else None
+        try:
+            await page.wait_for_url(f"{DOUYIN_MANAGE_URL}**", timeout=30000)
+        finally:
+            if verification:
+                verification.cancel()
+                await asyncio.gather(verification, return_exceptions=True)
+
+    try:
+        await wait_for_result()
+    except Exception:
+        try:
+            await _find_recent_work(page, title, kind, clicked_at)
+        except Exception as exc:
+            raise DouyinSubmissionUnknown(
+                f"UNKNOWN: 抖音{kind}提交结果不明，请先在作品管理核对原作品，禁止直接重发"
+            ) from exc
+        douyin_logger.success(f"{kind}发布成功：作品管理查到对应作品")
+    else:
+        douyin_logger.success(f"{kind}发布成功：已进入作品管理")
+
+
 async def _read_verify_code(code_file: str) -> str:
     if os.path.exists(code_file):
         with open(code_file, encoding="utf-8") as file_obj:
             return file_obj.read().strip()
 
-    if not sys.stdin or not sys.stdin.isatty():
+    if not sys.stdin or not sys.stdin.isatty() or not select.select([sys.stdin], [], [], 0)[0]:
         return ""
 
     try:
-        return (await asyncio.to_thread(input, "请输入抖音短信验证码（直接回车可稍后重试）: ")).strip()
+        return sys.stdin.readline().strip()
     except (EOFError, OSError):
         return ""
 
@@ -746,7 +814,7 @@ class DouYinVideo(DouYinBaseUploader):
                 pass
 
     async def _submit_sms_verify_code(self, page: Page, sms_input, code: str, code_file: str) -> bool:
-        douyin_logger.info(_msg("✍️", f"已获取验证码，准备填入: {code}"))
+        douyin_logger.info(_msg("✍️", "已获取验证码，准备填入"))
         await sms_input.click()
         await sms_input.fill(code)
         douyin_logger.info(_msg("✅", "验证码已填入输入框"))
@@ -1067,53 +1135,37 @@ class DouYinVideo(DouYinBaseUploader):
         if self.publish_strategy == DOUYIN_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
             await self.set_schedule_time_douyin(page, self.publish_date)
 
-        sms_prompt_logged = False
-        while True:
+        try:
+            await page.evaluate(
+                """() => document.querySelectorAll('.shepherd-element, .shepherd-modal-overlay-container, [class*="mention-wrapper"]').forEach(e => e.remove())"""
+            )
+            await self.handle_auto_video_cover(page)
+            await _publish_once(page, self.title[:30], "视频", after_click=self._verify_publish_sms)
+            await context.storage_state(path=self.account_file)
+            douyin_logger.success(_msg("🥳", "cookie 更新完毕"))
+        finally:
             try:
-                # 移除会拦截发布按钮点击的新手引导/话题下拉浮层
-                await page.evaluate(
-                    "() => { document.querySelectorAll('.shepherd-element, .shepherd-modal-overlay-container, [class*=\"mention-wrapper\"]').forEach(e => e.remove()); }"
-                )
-                # 检测并处理短信验证码弹窗
-                sms_input = page.locator('input[placeholder*="验证码"], input[type="tel"], input[placeholder*="短信"], input[placeholder*="手机号"]').first
-                if await sms_input.count() and await sms_input.is_visible():
-                    douyin_logger.warning(_msg("📱", "检测到短信验证码弹窗"))
-                    # 点击「获取验证码」按钮（仅首次）
-                    get_code_btn = page.get_by_text("获取验证码").first
-                    if await get_code_btn.count() and await get_code_btn.is_visible():
-                        await get_code_btn.click()
-                        douyin_logger.info(_msg("📤", "已点击「获取验证码」，请查看手机短信"))
-                    code_file = os.path.join(BASE_DIR, "verify_code.txt")
-                    code = await _read_verify_code(code_file)
-                    if code:
-                        sms_prompt_logged = False
-                        await self._submit_sms_verify_code(page, sms_input, code, code_file)
-                    elif not sms_prompt_logged:
-                        douyin_logger.warning(_msg("⏳", f"等待验证码输入；可在交互终端直接输入，或写入文件: {code_file}"))
-                        sms_prompt_logged = True
+                await context.close()
+            finally:
+                await browser.close()
 
-                # ── 正常发布流程 ──
-                publish_button = page.get_by_role("button", name="发布", exact=True)
-                if await publish_button.count():
-                    await publish_button.click(force=True)
-                await page.wait_for_url(
-                    "https://creator.douyin.com/creator-micro/content/manage**",
-                    timeout=3000,
-                )
-                douyin_logger.success(_msg("🥳", "视频发布成功，小人开心收工"))
-                break
-            except Exception:
-                await self.handle_auto_video_cover(page)
-                douyin_logger.info(_msg("🏃", "小人正在冲刺发布视频"))
-                if self.debug:
-                    await page.screenshot(full_page=True)
-                await asyncio.sleep(0.5)
-
-        await context.storage_state(path=self.account_file)
-        douyin_logger.success(_msg("🥳", "cookie 更新完毕"))
-        await asyncio.sleep(2)
-        await context.close()
-        await browser.close()
+    async def _verify_publish_sms(self, page: Page) -> None:
+        sms_input = page.locator('input[placeholder*="验证码"], input[type="tel"], input[placeholder*="短信"], input[placeholder*="手机号"]').first
+        await sms_input.wait_for(state="visible", timeout=30000)
+        douyin_logger.warning(_msg("📱", "检测到短信验证码弹窗"))
+        get_code_btn = page.get_by_text("获取验证码").first
+        if await get_code_btn.is_visible():
+            await get_code_btn.click(timeout=5000)
+            douyin_logger.info(_msg("📤", "已点击「获取验证码」，请查看手机短信"))
+        code_file = os.path.join(BASE_DIR, "verify_code.txt")
+        douyin_logger.warning(f"等待验证码输入；可直接输入后回车，或写入文件: {code_file}")
+        # The caller cancels this task when the bounded publish wait finishes.
+        while True:
+            code = await _read_verify_code(code_file)
+            if code:
+                await self._submit_sms_verify_code(page, sms_input, code, code_file)
+                return
+            await asyncio.sleep(0.5)
 
     async def douyin_upload_video(self):
         async with async_playwright() as playwright:
@@ -1212,20 +1264,7 @@ class DouYinNote(DouYinBaseUploader):
         if self.publish_strategy == DOUYIN_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
             await self.set_schedule_time_douyin(page, self.publish_date)
 
-        while True:
-            try:
-                publish_button = page.get_by_role("button", name="发布", exact=True)
-                if await publish_button.count():
-                    await publish_button.click()
-                await page.wait_for_url(
-                    "**/creator-micro/content/manage?enter_from=publish**",
-                    timeout=3000,
-                )
-                douyin_logger.success(_msg("🥳", "图文发布成功，小人开心收工"))
-                break
-            except Exception:
-                douyin_logger.info(_msg("🏃", "小人正在冲刺发布图文"))
-                await asyncio.sleep(0.5)
+        await _publish_once(page, self.title[:30], "图文")
 
     async def upload(self, playwright: Playwright) -> None:
         douyin_logger.info(_msg("🧍", "小人先检查 cookie、图片和发布时间"))
