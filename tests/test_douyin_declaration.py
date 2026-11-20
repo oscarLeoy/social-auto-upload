@@ -32,6 +32,13 @@ class DouyinDeclarationTests(unittest.TestCase):
 
         video = DouYinVideo(
             "标题", "/tmp/demo.mp4", [], 0, "/tmp/cookie.json",
+            None, "", "", None, "", "scheduled",
+        )
+        self.assertEqual(video.publish_strategy, "scheduled")
+        self.assertIsNone(video.collection_name)
+
+        video = DouYinVideo(
+            "标题", "/tmp/demo.mp4", [], 0, "/tmp/cookie.json",
             None, "", "", None, "",
             "scheduled", False, False, "明确声明",
             collection_name="合集",
